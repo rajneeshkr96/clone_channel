@@ -1,257 +1,120 @@
-# main.py
 import asyncio
-import uuid
-from datetime import datetime
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from telethon import TelegramClient
-from telethon.errors.rpcerrorlist import FloodWaitError
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import PeerChannel
+from telethon.errors.rpcerrorlist import FloodWaitError
 
-app = FastAPI()
-tasks = {}
-sessions = {}
-runner_state = {}
+# --- Configuration ---
+api_id = 20142771
+api_hash = '0d7aa3923c419850b6ae37180043b379'
+phone = '+14632325265'
 
-class StartLoginRequest(BaseModel):
-    phone: str
-    api_id: int
-    api_hash: str
+source_chat_id = -1002039777642
+target_chat_id = -1002791585068
 
-class ConfirmCodeRequest(BaseModel):
-    phone: str
-    code: str
-    api_id: int
-    api_hash: str
+delay_seconds = 1.5
+limit = 100 # Fetch more messages per request to reduce API calls
 
-class SubmitPasswordRequest(BaseModel):
-    phone: str
-    api_id: int
-    api_hash: str
-    password: str
+# --- Initialize Client ---
+client = TelegramClient('channel_clone_session', api_id, api_hash)
 
-class StartCloneRequest(BaseModel):
-    phone: str
-    api_id: int
-    api_hash: str
-    source_chat_id: int
-    target_chat_id: int
-    clone_start_id: int
-    delay_seconds: float = 1.5
-    limit: int = 100
+# --- Main Cloning Function ---
+async def main():
+    await client.start(phone)
+    print("✅ Logged in.")
 
-@app.get("/")
-def home():
-    return {"status": "working"}
+    try:
+        source_entity = await client.get_input_entity(PeerChannel(source_chat_id))
+        target_entity = await client.get_input_entity(PeerChannel(target_chat_id))
+        print(f"Source channel: {source_entity.title if hasattr(source_entity, 'title') else 'Unknown'}")
+        print(f"Target channel: {target_entity.title if hasattr(target_entity, 'title') else 'Unknown'}")
+    except Exception as e:
+        print(f"❌ Error getting chat entities. Make sure IDs are correct and you have access: {e}")
+        await client.disconnect()
+        return
 
-@app.post("/start-login")
-async def start_login(req: StartLoginRequest):
-    session_name = f"session_{req.phone}"
-    client = TelegramClient(session_name, req.api_id, req.api_hash)
-    await client.connect()
+    all_messages_to_clone = []
+    offset_id = 0 # Start from the latest message (or a high number if you know the max ID)
+    
+    print(f"Fetching ALL messages from source channel (this might take a while)...")
 
-    if not await client.is_user_authorized():
+    # Phase 1: Fetch all messages from newest to oldest
+    while True:
         try:
-            result = await client.send_code_request(req.phone)
-            sessions[req.phone] = {
-                "session_name": session_name,
-                "phone_code_hash": result.phone_code_hash,
-                "api_id": req.api_id,
-                "api_hash": req.api_hash
-            }
-            return {
-                "status": "code_sent",
-                "phone_code_hash": result.phone_code_hash
-            }
+            history = await client(GetHistoryRequest(
+                peer=source_entity,
+                offset_id=offset_id,
+                offset_date=None,
+                add_offset=0,
+                limit=limit,
+                max_id=0, # When offset_id is not 0, max_id=0 fetches older messages than offset_id
+                min_id=4750, # No minimum ID for fetching
+                hash=0
+            ))
+
+            messages = history.messages
+            if not messages:
+                break # No more messages
+
+            # Add fetched messages to our list
+            all_messages_to_clone.extend(messages)
+            
+            # Update offset_id to the oldest message in the current batch for the next fetch
+            offset_id = messages[-1].id
+            print(f"Fetched up to message ID {offset_id}. Total messages collected: {len(all_messages_to_clone)}")
+            await asyncio.sleep(0.5) # Small delay to avoid hitting limits during fetch phase
+
+        except FloodWaitError as fwe:
+            print(f"🚨 FloodWaitError during history fetch: Sleeping for {fwe.seconds} seconds.")
+            await asyncio.sleep(fwe.seconds)
         except Exception as e:
-            return {"error": str(e)}
-    return {"status": "already_logged_in"}
+            print(f"❌ Error fetching history: {e}")
+            break
+            
+    print(f"\n--- Finished fetching history. Total messages found: {len(all_messages_to_clone)} ---")
+    
+    # Phase 2: Sort all collected messages by ID in ascending order (oldest first)
+    print("Sorting messages in sequential order...")
+    all_messages_to_clone.sort(key=lambda msg: msg.id)
+    
+    total_cloned = 0
+    print(f"Starting cloning of messages from the oldest to the newest.")
 
-@app.post("/confirm-login")
-async def confirm_login(req: ConfirmCodeRequest):
-    session_info = sessions.get(req.phone)
-    if not session_info:
-        raise HTTPException(status_code=400, detail="No code request found for this phone.")
-
-    session_name = session_info["session_name"]
-    phone_code_hash = session_info["phone_code_hash"]
-    client = TelegramClient(session_name, req.api_id, req.api_hash)
-    await client.connect()
-
-    try:
-        await client.sign_in(phone=req.phone, code=req.code, phone_code_hash=phone_code_hash)
-        return {"status": "signed_in_without_password"}
-    except Exception as e:
-        if "password is required" in str(e):
-            return {
-                "status": "2fa_required",
-                "message": "Two-step verification enabled. Please provide password using /submit-password."
-            }
-        return {"error": str(e)}
-
-@app.post("/submit-password")
-async def submit_password(req: SubmitPasswordRequest):
-    session_info = sessions.get(req.phone)
-    if not session_info:
-        raise HTTPException(status_code=400, detail="No session info found for this phone.")
-
-    session_name = session_info["session_name"]
-    client = TelegramClient(session_name, req.api_id, req.api_hash)
-    await client.connect()
-
-    try:
-        await client.sign_in(password=req.password)
-        return {"status": "signed_in_with_password"}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/start-clone")
-async def start_clone(req: StartCloneRequest):
-    runner_id = str(uuid.uuid4())
-    session_name = sessions.get(req.phone, {}).get("session_name", f"session_{req.phone}")
-
-    runner_state[runner_id] = {
-        "runner_id": runner_id,
-        "status": "starting",
-        "started_at": datetime.utcnow().isoformat(),
-        "total_messages_fetched": 0,
-        "messages_cloned": 0,
-        "last_cloned_id": None,
-        "error": None
-    }
-
-    async def clone():
-        client = TelegramClient(session_name, req.api_id, req.api_hash)
-        await client.connect()
+    # Phase 3: Clone messages sequentially
+    for message in all_messages_to_clone:
+        # Skip service messages (user joined, channel created etc.)
+        if message.action:
+            # print(f"➡️ Skipping service message {message.id}")
+            continue
 
         try:
-            source = await client.get_input_entity(PeerChannel(req.source_chat_id))
-            target = await client.get_input_entity(PeerChannel(req.target_chat_id))
+            if message.media:
+                await client.send_file(
+                    target_entity,
+                    file=message.media,
+                    caption=message.message or "",
+                    silent=False,
+                    allow_cache=True
+                )
+            elif message.message:
+                await client.send_message(target_entity, message.message)
+            else:
+                # print(f"⚠️ Skipped empty/unsupported message {message.id}")
+                continue
+
+            total_cloned += 1
+            print(f"✅ Cloned message {message.id} (Total cloned: {total_cloned})")
+            await asyncio.sleep(delay_seconds) # Respect the delay between sending messages
+        except FloodWaitError as fwe:
+            print(f"🚨 FloodWaitError: Sleeping for {fwe.seconds} seconds.")
+            await asyncio.sleep(fwe.seconds)
         except Exception as e:
-            runner_state[runner_id]["status"] = "error"
-            runner_state[runner_id]["error"] = str(e)
-            await client.disconnect()
-            return
+            print(f"❌ Error cloning message {message.id}: {e}")
 
-        all_messages = []
-        offset_id = 0
-        while True:
-            try:
-                history = await client(GetHistoryRequest(
-                    peer=source,
-                    offset_id=offset_id,
-                    offset_date=None,
-                    add_offset=0,
-                    limit=req.limit,
-                    max_id=0,
-                    min_id=req.clone_start_id,
-                    hash=0
-                ))
-                msgs = history.messages
-                if not msgs:
-                    break
-                all_messages.extend(msgs)
-                offset_id = msgs[-1].id
-                runner_state[runner_id]["total_messages_fetched"] = len(all_messages)
-                await asyncio.sleep(0.5)
-            except FloodWaitError as fwe:
-                await asyncio.sleep(fwe.seconds)
-            except Exception as e:
-                runner_state[runner_id]["error"] = str(e)
-                break
+    print(f"🎉 Done! Total messages cloned: {total_cloned}")
+    await client.disconnect()
 
-        all_messages.sort(key=lambda msg: msg.id)
-        count = 0
-
-        for message in all_messages:
-            if message.action:
-                continue
-            try:
-                if message.media:
-                    await client.send_file(target, file=message.media, caption=message.message or "")
-                elif message.message:
-                    await client.send_message(target, message.message)
-
-                count += 1
-                runner_state[runner_id]["messages_cloned"] = count
-                runner_state[runner_id]["last_cloned_id"] = message.id
-
-                if count % 1000 == 0:
-                    await asyncio.sleep(req.rest_sec)
-                await asyncio.sleep(req.delay_seconds)
-            except FloodWaitError as fwe:
-                await asyncio.sleep(fwe.seconds)
-            except Exception:
-                continue
-
-        runner_state[runner_id]["status"] = "completed"
-        await client.disconnect()
-
-    task = asyncio.create_task(clone())
-    tasks[runner_id] = task
-    return {"runner_id": runner_id}
-
-@app.post("/stop-clone")
-async def stop_clone(runner_id: str):
-    task = tasks.get(runner_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Runner ID not found")
-    task.cancel()
-    del tasks[runner_id]
-    return {"status": "stopped", "runner_id": runner_id}
-
-@app.get("/status")
-async def check_status(runner_id: str):
-    state = runner_state.get(runner_id)
-    task = tasks.get(runner_id)
-
-    if not state:
-        return JSONResponse(content={"status": "not_found", "runner_id": runner_id}, status_code=404)
-
-    if task:
-        if task.cancelled():
-            state["status"] = "cancelled"
-        elif task.done():
-            state["status"] = state.get("status", "completed")
-        else:
-            state["status"] = "running"
-
-    return state
-
-@app.get("/runners")
-async def list_all_runners():
-    runner_statuses = []
-
-    for runner_id, task in tasks.items():
-        if task.cancelled():
-            status = "cancelled"
-        elif task.done():
-            status = "completed"
-        else:
-            status = "running"
-
-        runner_statuses.append({
-            "runner_id": runner_id,
-            "status": status
-        })
-
-    return {
-        "total_runners": len(runner_statuses),
-        "runners": runner_statuses
-    }
-
-
-@app.get("/login-status")
-async def login_status(phone: str):
-    session_info = sessions.get(phone)
-    if not session_info:
-        return {"status": "not_logged_in"}
-    client = TelegramClient(session_info["session_name"], session_info["api_id"], session_info["api_hash"])
-    await client.connect()
-    try:
-        authorized = await client.is_user_authorized()
-        return {"status": "logged_in" if authorized else "not_logged_in"}
-    finally:
-        await client.disconnect()
+# --- Run the client ---
+if __name__ == '__main__':
+    with client:
+        client.loop.run_until_complete(main())
