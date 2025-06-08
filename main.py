@@ -1,19 +1,24 @@
 import asyncio
+import os
+from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetHistoryRequest
 from telethon.tl.types import PeerChannel
 from telethon.errors.rpcerrorlist import FloodWaitError
 
-# --- Configuration ---
-api_id = 20142771
-api_hash = '0d7aa3923c419850b6ae37180043b379'
-phone = '+14632325265'
+# --- Load environment variables ---
+load_dotenv()
 
-source_chat_id = -1002039777642
-target_chat_id = -1002791585068
+api_id = int(os.getenv("API_ID"))
+api_hash = os.getenv("API_HASH")
+phone = os.getenv("PHONE")
 
+source_chat_id = int(os.getenv("SOURCE_CHAT_ID"))
+target_chat_id = int(os.getenv("TARGET_CHAT_ID"))
+clone_start_id = int(os.getenv("CLONE_START_ID"))
+wait = 1800
 delay_seconds = 1.5
-limit = 100 # Fetch more messages per request to reduce API calls
+limit = 100  # Number of messages per API request
 
 # --- Initialize Client ---
 client = TelegramClient('channel_clone_session', api_id, api_hash)
@@ -34,11 +39,11 @@ async def main():
         return
 
     all_messages_to_clone = []
-    offset_id = 0 # Start from the latest message (or a high number if you know the max ID)
-    
+    offset_id = 0
+
     print(f"Fetching ALL messages from source channel (this might take a while)...")
 
-    # Phase 1: Fetch all messages from newest to oldest
+    # --- Phase 1: Fetch history ---
     while True:
         try:
             history = await client(GetHistoryRequest(
@@ -47,22 +52,19 @@ async def main():
                 offset_date=None,
                 add_offset=0,
                 limit=limit,
-                max_id=0, # When offset_id is not 0, max_id=0 fetches older messages than offset_id
-                min_id=6639, # No minimum ID for fetching
+                max_id=0,
+                min_id=clone_start_id,
                 hash=0
             ))
 
             messages = history.messages
             if not messages:
-                break # No more messages
+                break
 
-            # Add fetched messages to our list
             all_messages_to_clone.extend(messages)
-            
-            # Update offset_id to the oldest message in the current batch for the next fetch
             offset_id = messages[-1].id
             print(f"Fetched up to message ID {offset_id}. Total messages collected: {len(all_messages_to_clone)}")
-            await asyncio.sleep(0.5) # Small delay to avoid hitting limits during fetch phase
+            await asyncio.sleep(0.5)
 
         except FloodWaitError as fwe:
             print(f"🚨 FloodWaitError during history fetch: Sleeping for {fwe.seconds} seconds.")
@@ -70,21 +72,19 @@ async def main():
         except Exception as e:
             print(f"❌ Error fetching history: {e}")
             break
-            
+
     print(f"\n--- Finished fetching history. Total messages found: {len(all_messages_to_clone)} ---")
-    
-    # Phase 2: Sort all collected messages by ID in ascending order (oldest first)
+
+    # --- Phase 2: Sort messages ---
     print("Sorting messages in sequential order...")
     all_messages_to_clone.sort(key=lambda msg: msg.id)
-    
+
+    # --- Phase 3: Clone messages ---
     total_cloned = 0
     print(f"Starting cloning of messages from the oldest to the newest.")
 
-    # Phase 3: Clone messages sequentially
-    for message in all_messages_to_clone:
-        # Skip service messages (user joined, channel created etc.)
+    for index, message in enumerate(all_messages_to_clone):
         if message.action:
-            # print(f"➡️ Skipping service message {message.id}")
             continue
 
         try:
@@ -99,12 +99,18 @@ async def main():
             elif message.message:
                 await client.send_message(target_entity, message.message)
             else:
-                # print(f"⚠️ Skipped empty/unsupported message {message.id}")
                 continue
 
             total_cloned += 1
             print(f"✅ Cloned message {message.id} (Total cloned: {total_cloned})")
-            await asyncio.sleep(delay_seconds) # Respect the delay between sending messages
+
+            # 🕒 Wait 30 minutes after every 1500 messages
+            if total_cloned % 600 == 0:
+                print("⏳ Reached 1500 messages. Waiting for 30 minutes to avoid rate limits...")
+                await asyncio.sleep(wait)  # 30 minutes
+
+            await asyncio.sleep(delay_seconds)
+
         except FloodWaitError as fwe:
             print(f"🚨 FloodWaitError: Sleeping for {fwe.seconds} seconds.")
             await asyncio.sleep(fwe.seconds)
