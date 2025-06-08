@@ -48,7 +48,7 @@ async def main():
                 add_offset=0,
                 limit=limit,
                 max_id=0, # When offset_id is not 0, max_id=0 fetches older messages than offset_id
-                min_id=4750, # No minimum ID for fetching
+                min_id=6639, # No minimum ID for fetching
                 hash=0
             ))
 
